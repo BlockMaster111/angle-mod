@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "angle",
+  "version": "${version}",
+  "name": "Angle",
+  "description": "Client-Command /angle <pitch> <yaw>: dreht die Kamera menschlich zum Zielwinkel.",
+  "environment": "client",
+  "entrypoints": { "client": [ "dev.angle.AngleClient" ] },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": ">=26.3- <26.4",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
