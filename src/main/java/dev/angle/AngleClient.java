@@ -20,6 +20,11 @@ public class AngleClient implements ClientModInitializer {
     private static final double TREMOR_DEG = 0.02;     // minimales Handzittern
     private static final double MAX_CURVE = 0.05;      // seitliche Bogenform des Wegs (Anteil der Distanz)
 
+    // Geschwindigkeitsprofil: Mitte schneller, Endphase unveraendert.
+    // Bis ENDPHASE_START (Anteil der alten Gesamtzeit) laeuft die schnelle Phase, danach exakt das alte Abbremsen.
+    private static final double ENDPHASE_START = 0.752;  // ab hier (alte Zeitachse) wird abgebremst
+    private static final double FAST_PHASE_TIME = 0.55;  // Dauer der schnellen Phase relativ zu frueher (0.752 -> 0.55)
+
     private static final Random RNG = new Random();
 
     private static boolean active = false;
@@ -82,14 +87,30 @@ public class AngleClient implements ClientModInitializer {
         return t * t * t * (10 + t * (-15 + 6 * t));
     }
 
+    /** Fortschritt 0..1 zur Zeit elapsedMs; d0 = alte Gesamtdauer. */
+    private static double progress(double elapsedMs, double d0) {
+        double t0 = ENDPHASE_START;
+        double tFast = FAST_PHASE_TIME * d0;
+        double a = minJerk(t0);                                  // Strecke, die die schnelle Phase schafft
+        if (elapsedMs < tFast) {
+            double tau = elapsedMs / tFast;
+            double vEnd = 30 * t0 * t0 * (1 - t0) * (1 - t0);    // Geschwindigkeit am Uebergang (wie frueher)
+            double m1 = vEnd * FAST_PHASE_TIME;
+            return a * (-2 * tau * tau * tau + 3 * tau * tau) + m1 * (tau * tau * tau - tau * tau);
+        }
+        double tt = t0 + (elapsedMs - tFast) / d0;               // Endphase wie frueher
+        return minJerk(Math.min(tt, 1.0));
+    }
+
     private static void tick(Minecraft mc) {
         if (!active) return;
         LocalPlayer p = mc.player;
         if (p == null) { active = false; return; }
 
         double elapsedMs = (System.nanoTime() - startNanos) / 1_000_000.0;
-        double t = Mth.clamp(elapsedMs / durationMs, 0.0, 1.0);
-        double s = minJerk(t);
+        double totalMs = durationMs * (FAST_PHASE_TIME + (1.0 - ENDPHASE_START));
+        double t = Mth.clamp(elapsedMs / totalMs, 0.0, 1.0);
+        double s = progress(Math.min(elapsedMs, totalMs), durationMs);
 
         // Bogen: Auslenkung senkrecht zur Bewegungsrichtung, 0 am Start und am Ziel
         double bow = Math.sin(Math.PI * t) * curve;
