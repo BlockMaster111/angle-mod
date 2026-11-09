@@ -31,6 +31,12 @@ public class AngleClient implements ClientModInitializer {
     private static final double SETTLE_MIN_MS = 550, SETTLE_MAX_MS = 900;
     private static final double SETTLE_MIN_DEG = 0.15, SETTLE_MAX_DEG = 0.35;
 
+    // Echter Maus-Input stoppt die Bewegung: Wenn sich die Kamera zwischen zwei Ticks von dem unterscheidet,
+    // was der Mod zuletzt gesetzt hat, kam der Unterschied von dir. Summe ueber die Bewegung > Schwelle = Abbruch.
+    private static final double INPUT_CANCEL_DEG = 0.5;
+    private static float lastSetPitch, lastSetYaw;
+    private static double inputAccum;
+
     private static boolean active = false;
     private static boolean settling = false;
     private static long settleStartNanos;
@@ -87,6 +93,9 @@ public class AngleClient implements ClientModInitializer {
         curve = (RNG.nextDouble() * 2 - 1) * MAX_CURVE;
         startNanos = System.nanoTime();
         lastPitchNoise = lastYawNoise = 0;
+        lastSetPitch = p.getXRot();
+        lastSetYaw = p.getYRot();
+        inputAccum = 0;
         settling = false;
         active = true;
     }
@@ -116,6 +125,16 @@ public class AngleClient implements ClientModInitializer {
         LocalPlayer p = mc.player;
         if (p == null) { active = false; settling = false; return; }
 
+        // Hat der Spieler die Maus bewegt? Dann sofort aufhoeren und seine Kamera nicht ueberschreiben.
+        double devPitch = p.getXRot() - lastSetPitch;
+        double devYaw = Mth.wrapDegrees(p.getYRot() - lastSetYaw);
+        inputAccum += Math.hypot(devPitch, devYaw);
+        if (inputAccum > INPUT_CANCEL_DEG) {
+            active = false;
+            settling = false;
+            return;
+        }
+
         if (settling) {
             double u = Mth.clamp((System.nanoTime() - settleStartNanos) / 1_000_000.0 / settleMs, 0.0, 1.0);
             double e = minJerk(u);
@@ -124,6 +143,8 @@ public class AngleClient implements ClientModInitializer {
             lastYawNoise = lastYawNoise * 0.6 + RNG.nextGaussian() * 0.01 * fadeS;
             p.setXRot((float) Mth.clamp(settleBasePitch + settleDPitch * e + lastPitchNoise, -90.0, 90.0));
             p.setYRot((float) (settleBaseYaw + settleDYaw * e + lastYawNoise));
+            lastSetPitch = p.getXRot();
+            lastSetYaw = p.getYRot();
             if (u >= 1.0) { active = false; settling = false; }
             return;
         }
@@ -147,6 +168,8 @@ public class AngleClient implements ClientModInitializer {
 
         p.setXRot((float) Mth.clamp(pitch, -90.0, 90.0));
         p.setYRot((float) yaw);
+        lastSetPitch = p.getXRot();
+        lastSetYaw = p.getYRot();
 
         if (t >= 1.0) beginSettle();
     }
