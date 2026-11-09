@@ -2,7 +2,7 @@ package dev.angle;
 
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
@@ -31,13 +31,13 @@ public class AngleClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
-            dispatcher.register(ClientCommandManager.literal("angle")
-                .then(ClientCommandManager.literal("stop").executes(ctx -> {
+            dispatcher.register(ClientCommands.literal("angle")
+                .then(ClientCommands.literal("stop").executes(ctx -> {
                     active = false;
                     return 1;
                 }))
-                .then(ClientCommandManager.argument("pitch", DoubleArgumentType.doubleArg(-90, 90))
-                    .then(ClientCommandManager.argument("yaw", DoubleArgumentType.doubleArg(-100000, 100000))
+                .then(ClientCommands.argument("pitch", DoubleArgumentType.doubleArg(-90, 90))
+                    .then(ClientCommands.argument("yaw", DoubleArgumentType.doubleArg(-100000, 100000))
                         .executes(ctx -> {
                             double pitch = DoubleArgumentType.getDouble(ctx, "pitch");
                             double yaw = DoubleArgumentType.getDouble(ctx, "yaw");
