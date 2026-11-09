@@ -27,7 +27,14 @@ public class AngleClient implements ClientModInitializer {
 
     private static final Random RNG = new Random();
 
+    // Nachlauf: nach dem Ziel noch kurz minimal weiterdriften (unter 1 Sekunde)
+    private static final double SETTLE_MIN_MS = 550, SETTLE_MAX_MS = 900;
+    private static final double SETTLE_MIN_DEG = 0.15, SETTLE_MAX_DEG = 0.35;
+
     private static boolean active = false;
+    private static boolean settling = false;
+    private static long settleStartNanos;
+    private static double settleMs, settleDPitch, settleDYaw, settleBasePitch, settleBaseYaw;
     private static double startPitch, startYaw, dPitch, dYaw;
     private static double curve;          // seitliche Ausbuchtung
     private static long startNanos;
@@ -40,6 +47,7 @@ public class AngleClient implements ClientModInitializer {
             dispatcher.register(ClientCommands.literal("angle")
                 .then(ClientCommands.literal("stop").executes(ctx -> {
                     active = false;
+                    settling = false;
                     return 1;
                 }))
                 .then(ClientCommands.argument("pitch", DoubleArgumentType.doubleArg(-90, 90))
@@ -79,6 +87,7 @@ public class AngleClient implements ClientModInitializer {
         curve = (RNG.nextDouble() * 2 - 1) * MAX_CURVE;
         startNanos = System.nanoTime();
         lastPitchNoise = lastYawNoise = 0;
+        settling = false;
         active = true;
     }
 
@@ -105,7 +114,19 @@ public class AngleClient implements ClientModInitializer {
     private static void tick(Minecraft mc) {
         if (!active) return;
         LocalPlayer p = mc.player;
-        if (p == null) { active = false; return; }
+        if (p == null) { active = false; settling = false; return; }
+
+        if (settling) {
+            double u = Mth.clamp((System.nanoTime() - settleStartNanos) / 1_000_000.0 / settleMs, 0.0, 1.0);
+            double e = minJerk(u);
+            double fadeS = 1.0 - u;
+            lastPitchNoise = lastPitchNoise * 0.6 + RNG.nextGaussian() * 0.01 * fadeS;
+            lastYawNoise = lastYawNoise * 0.6 + RNG.nextGaussian() * 0.01 * fadeS;
+            p.setXRot((float) Mth.clamp(settleBasePitch + settleDPitch * e + lastPitchNoise, -90.0, 90.0));
+            p.setYRot((float) (settleBaseYaw + settleDYaw * e + lastYawNoise));
+            if (u >= 1.0) { active = false; settling = false; }
+            return;
+        }
 
         double elapsedMs = (System.nanoTime() - startNanos) / 1_000_000.0;
         double totalMs = durationMs * (FAST_PHASE_TIME + (1.0 - ENDPHASE_START));
@@ -127,6 +148,22 @@ public class AngleClient implements ClientModInitializer {
         p.setXRot((float) Mth.clamp(pitch, -90.0, 90.0));
         p.setYRot((float) yaw);
 
-        if (t >= 1.0) active = false;
+        if (t >= 1.0) beginSettle();
+    }
+
+    /** Kurzes, minimales Weiterdriften in grob gleicher Richtung, dann Stillstand. */
+    private static void beginSettle() {
+        settleBasePitch = startPitch + dPitch;
+        settleBaseYaw = startYaw + dYaw;
+        double heading = (Math.hypot(dYaw, dPitch) > 0.01)
+                ? Math.atan2(dPitch, dYaw)
+                : RNG.nextDouble() * 2 * Math.PI;
+        heading += Math.toRadians((RNG.nextDouble() * 2 - 1) * 50.0);
+        double mag = SETTLE_MIN_DEG + RNG.nextDouble() * (SETTLE_MAX_DEG - SETTLE_MIN_DEG);
+        settleDYaw = Math.cos(heading) * mag;
+        settleDPitch = Math.sin(heading) * mag;
+        settleMs = SETTLE_MIN_MS + RNG.nextDouble() * (SETTLE_MAX_MS - SETTLE_MIN_MS);
+        settleStartNanos = System.nanoTime();
+        settling = true;
     }
 }
