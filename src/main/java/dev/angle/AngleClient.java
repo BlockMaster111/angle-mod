@@ -15,9 +15,10 @@ import java.util.Random;
 public class AngleClient implements ClientModInitializer {
 
     // ---- Einstellungen ----
-    private static final double MAX_OFFSET_DEG = 2.5;   // max. Abweichung von Pitch/Yaw (wenige Grad)
-    private static final double TREMOR_DEG = 0.06;     // minimales Handzittern
-    private static final double MAX_CURVE = 0.10;      // seitliche Bogenform des Wegs (Anteil der Distanz)
+    private static final double MIN_OFFSET_DEG = 1.0;   // min. Abweichung von Pitch/Yaw
+    private static final double MAX_OFFSET_DEG = 2.0;   // max. Abweichung von Pitch/Yaw (wenige Grad)
+    private static final double TREMOR_DEG = 0.02;     // minimales Handzittern
+    private static final double MAX_CURVE = 0.05;      // seitliche Bogenform des Wegs (Anteil der Distanz)
 
     private static final Random RNG = new Random();
 
@@ -45,13 +46,13 @@ public class AngleClient implements ClientModInitializer {
                             return 1;
                         })))));
 
-        ClientTickEvents.START_CLIENT_TICK.register(AngleClient::tick);
+        ClientTickEvents.END_CLIENT_TICK.register(AngleClient::tick);
     }
 
     private static double offset() {
-        // Gauss-verteilt, begrenzt, damit es meistens klein ist
-        double g = RNG.nextGaussian() * (MAX_OFFSET_DEG / 2.0);
-        return Mth.clamp(g, -MAX_OFFSET_DEG, MAX_OFFSET_DEG);
+        // immer ein paar Grad daneben: Betrag 1.0 bis 2.0, Vorzeichen zufaellig
+        double mag = MIN_OFFSET_DEG + RNG.nextDouble() * (MAX_OFFSET_DEG - MIN_OFFSET_DEG);
+        return RNG.nextBoolean() ? mag : -mag;
     }
 
     private static void start(double pitch, double yaw) {
