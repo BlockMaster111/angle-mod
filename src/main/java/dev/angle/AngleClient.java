@@ -18,18 +18,23 @@ public class AngleClient implements ClientModInitializer {
     private static final double MIN_OFFSET_DEG = 1.0;   // min. Abweichung von Pitch/Yaw
     private static final double MAX_OFFSET_DEG = 2.0;   // max. Abweichung von Pitch/Yaw (wenige Grad)
     private static final double TREMOR_DEG = 0.02;     // minimales Handzittern
-    private static final double MAX_CURVE = 0.05;      // seitliche Bogenform des Wegs (Anteil der Distanz)
 
-    // Geschwindigkeitsprofil: Mitte schneller, Endphase unveraendert.
-    // Bis ENDPHASE_START (Anteil der alten Gesamtzeit) laeuft die schnelle Phase, danach exakt das alte Abbremsen.
-    private static final double ENDPHASE_START = 0.752;  // ab hier (alte Zeitachse) wird abgebremst
-    private static final double FAST_PHASE_TIME = 0.55;  // Dauer der schnellen Phase relativ zu frueher (0.752 -> 0.55)
+    // Aus deiner Aufnahme abgeleitetes Bewegungsmodell (Median ueber ~80 Drehungen >= 40 Grad):
+    // Fortschritt (0..1) ueber normalisierte Zeit 0.0, 0.1, ... 1.0 - frueh schnell, langes weiches Auslaufen.
+    private static final double[] SHAPE = { 0.0, 0.033, 0.141, 0.288, 0.442, 0.605, 0.757, 0.88, 0.957, 0.99, 1.0 };
+    private static double[] shapeSlopes;   // Tangenten fuer monotone kubische Interpolation
+
+    // Gesamtdauer: 240 + 35*ln(1 + Winkel/20) ms (bei dir kaum von der Strecke abhaengig), mal SPEED_SCALE.
+    // SPEED_SCALE < 1 = schneller als dein Median. 1.0 = exakt dein Median, 0.75 = deine schnelleren Drehungen.
+    private static final double SPEED_SCALE = 0.75;
+    private static final double DURATION_SPREAD = 0.20;   // Streuung der Dauer (log-normal)
+    private static final double CURVE_MEDIAN = 0.023;     // seitliche Ausbuchtung relativ zur Strecke (dein Median)
 
     private static final Random RNG = new Random();
 
     // Nachlauf: nach dem Ziel noch kurz minimal weiterdriften (unter 1 Sekunde)
-    private static final double SETTLE_MIN_MS = 550, SETTLE_MAX_MS = 900;
-    private static final double SETTLE_MIN_DEG = 0.15, SETTLE_MAX_DEG = 0.35;
+    private static final double SETTLE_MIN_MS = 400, SETTLE_MAX_MS = 900;
+    private static final double SETTLE_MIN_DEG = 0.05, SETTLE_MAX_DEG = 0.25;
 
     // Echter Maus-Input stoppt die Bewegung: Wenn sich die Kamera zwischen zwei Ticks von dem unterscheidet,
     // was der Mod zuletzt gesetzt hat, kam der Unterschied von dir. Summe ueber die Bewegung > Schwelle = Abbruch.
@@ -111,10 +116,11 @@ public class AngleClient implements ClientModInitializer {
         dYaw = Mth.wrapDegrees(targetYaw - startYaw); // kuerzester Weg
 
         double dist = Math.hypot(dPitch, dYaw);
-        // Fitts-aehnlich: weiter = laenger, plus zufaellige Reaktionszeit/Tempo
-        durationMs = (40 + 1.5 * Math.pow(dist, 0.9)) * (0.85 + RNG.nextDouble() * 0.35);
-        durationMs = Mth.clamp(durationMs, 50, 400);
-        curve = (RNG.nextDouble() * 2 - 1) * MAX_CURVE;
+        double base = (240 + 35 * Math.log(1 + dist / 20.0)) * SPEED_SCALE;
+        durationMs = base * Math.exp(RNG.nextGaussian() * DURATION_SPREAD);
+        durationMs = Mth.clamp(durationMs, 80, 900);
+        double mag = Mth.clamp(CURVE_MEDIAN * Math.exp(RNG.nextGaussian() * 0.7), 0.003, 0.08);
+        curve = RNG.nextBoolean() ? mag : -mag;
         startNanos = System.nanoTime();
         lastPitchNoise = lastYawNoise = 0;
         lastSetPitch = p.getXRot();
@@ -129,19 +135,42 @@ public class AngleClient implements ClientModInitializer {
         return t * t * t * (10 + t * (-15 + 6 * t));
     }
 
-    /** Fortschritt 0..1 zur Zeit elapsedMs; d0 = alte Gesamtdauer. */
-    private static double progress(double elapsedMs, double d0) {
-        double t0 = ENDPHASE_START;
-        double tFast = FAST_PHASE_TIME * d0;
-        double a = minJerk(t0);                                  // Strecke, die die schnelle Phase schafft
-        if (elapsedMs < tFast) {
-            double tau = elapsedMs / tFast;
-            double vEnd = 30 * t0 * t0 * (1 - t0) * (1 - t0);    // Geschwindigkeit am Uebergang (wie frueher)
-            double m1 = vEnd * FAST_PHASE_TIME;
-            return a * (-2 * tau * tau * tau + 3 * tau * tau) + m1 * (tau * tau * tau - tau * tau);
+    /** Fortschritt 0..1 bei normalisierter Zeit t (0..1): monotone kubische Interpolation durch SHAPE. */
+    private static double shape(double t) {
+        if (shapeSlopes == null) shapeSlopes = computeSlopes();
+        int n = SHAPE.length - 1;
+        double x = Mth.clamp(t, 0.0, 1.0) * n;
+        int i = Math.min((int) x, n - 1);
+        double u = x - i;
+        double u2 = u * u, u3 = u2 * u;
+        double h = 1.0 / n;
+        return (2 * u3 - 3 * u2 + 1) * SHAPE[i]
+             + (u3 - 2 * u2 + u) * h * shapeSlopes[i]
+             + (-2 * u3 + 3 * u2) * SHAPE[i + 1]
+             + (u3 - u2) * h * shapeSlopes[i + 1];
+    }
+
+    /** Fritsch-Carlson: Tangenten so waehlen, dass die Kurve nie rueckwaerts laeuft; Start/Ende mit Geschwindigkeit 0. */
+    private static double[] computeSlopes() {
+        int n = SHAPE.length - 1;
+        double h = 1.0 / n;
+        double[] d = new double[n];
+        for (int i = 0; i < n; i++) d[i] = (SHAPE[i + 1] - SHAPE[i]) / h;
+        double[] m = new double[n + 1];
+        m[0] = 0;
+        m[n] = 0;
+        for (int i = 1; i < n; i++) m[i] = (d[i - 1] + d[i]) / 2.0;
+        for (int i = 0; i < n; i++) {
+            if (d[i] == 0) { m[i] = 0; m[i + 1] = 0; continue; }
+            double a = m[i] / d[i], b = m[i + 1] / d[i];
+            double r = a * a + b * b;
+            if (r > 9) {
+                double k = 3 / Math.sqrt(r);
+                m[i] = k * a * d[i];
+                m[i + 1] = k * b * d[i];
+            }
         }
-        double tt = t0 + (elapsedMs - tFast) / d0;               // Endphase wie frueher
-        return minJerk(Math.min(tt, 1.0));
+        return m;
     }
 
     private static void tick(Minecraft mc) {
@@ -174,14 +203,13 @@ public class AngleClient implements ClientModInitializer {
         }
 
         double elapsedMs = (System.nanoTime() - startNanos) / 1_000_000.0;
-        double totalMs = durationMs * (FAST_PHASE_TIME + (1.0 - ENDPHASE_START));
-        double t = Mth.clamp(elapsedMs / totalMs, 0.0, 1.0);
-        double s = progress(Math.min(elapsedMs, totalMs), durationMs);
+        double t = Mth.clamp(elapsedMs / durationMs, 0.0, 1.0);
+        double s = shape(t);
 
         // Bogen: Auslenkung senkrecht zur Bewegungsrichtung, 0 am Start und am Ziel
         double bow = Math.sin(Math.PI * t) * curve;
-        double pitch = startPitch + dPitch * s + (-dYaw) * bow * 0.5;
-        double yaw = startYaw + dYaw * s + dPitch * bow;
+        double pitch = startPitch + dPitch * s + dYaw * bow;     // senkrecht zur Bewegungsrichtung
+        double yaw = startYaw + dYaw * s - dPitch * bow;
 
         // Zittern, das gegen Ende abklingt (Ziel wird sauber erreicht)
         double fade = 1.0 - t;
@@ -202,10 +230,7 @@ public class AngleClient implements ClientModInitializer {
     private static void beginSettle() {
         settleBasePitch = startPitch + dPitch;
         settleBaseYaw = startYaw + dYaw;
-        double heading = (Math.hypot(dYaw, dPitch) > 0.01)
-                ? Math.atan2(dPitch, dYaw)
-                : RNG.nextDouble() * 2 * Math.PI;
-        heading += Math.toRadians((RNG.nextDouble() * 2 - 1) * 50.0);
+        double heading = RNG.nextDouble() * 2 * Math.PI;   // in deiner Aufnahme keine Vorzugsrichtung
         double mag = SETTLE_MIN_DEG + RNG.nextDouble() * (SETTLE_MAX_DEG - SETTLE_MIN_DEG);
         settleDYaw = Math.cos(heading) * mag;
         settleDPitch = Math.sin(heading) * mag;
