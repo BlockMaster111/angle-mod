@@ -51,6 +51,28 @@ public class AngleClient implements ClientModInitializer {
     public void onInitializeClient() {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
             dispatcher.register(ClientCommands.literal("angle")
+                .then(ClientCommands.literal("record")
+                    .then(ClientCommands.literal("start").executes(ctx -> {
+                        try {
+                            java.nio.file.Path path = Recorder.start();
+                            ctx.getSource().sendFeedback(Component.literal(
+                                "Aufnahme gestartet. Beenden mit /angle record stop. Datei: " + path));
+                        } catch (java.io.IOException e) {
+                            ctx.getSource().sendFeedback(Component.literal("Aufnahme konnte nicht gestartet werden: " + e.getMessage()));
+                        }
+                        return 1;
+                    }))
+                    .then(ClientCommands.literal("stop").executes(ctx -> {
+                        long n = Recorder.samples();
+                        java.nio.file.Path path = Recorder.stop();
+                        if (path == null) {
+                            ctx.getSource().sendFeedback(Component.literal("Es laeuft keine Aufnahme."));
+                        } else {
+                            ctx.getSource().sendFeedback(Component.literal(
+                                "Aufnahme beendet (" + n + " Zeilen). Schick mir diese Datei: " + path));
+                        }
+                        return 1;
+                    })))
                 .then(ClientCommands.literal("stop").executes(ctx -> {
                     active = false;
                     settling = false;
@@ -66,6 +88,8 @@ public class AngleClient implements ClientModInitializer {
                         })))));
 
         ClientTickEvents.END_CLIENT_TICK.register(AngleClient::tick);
+        net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents.CLIENT_STOPPING
+            .register(client -> Recorder.stop());
     }
 
     private static double offset() {
