@@ -42,6 +42,11 @@ public class AngleClient implements ClientModInitializer {
     private static float lastSetPitch, lastSetYaw;
     private static double inputAccum;
 
+    // Sperre: Nach einem angenommenen /angle wird 0.3 s lang (ab Start der Bewegung) kein neuer angenommen.
+    private static final long COOLDOWN_NANOS = 300_000_000L;
+    private static long lastAcceptedNanos = 0;
+    private static boolean hasAccepted = false;
+
     private static boolean active = false;
     private static boolean settling = false;
     private static long settleStartNanos;
@@ -106,6 +111,11 @@ public class AngleClient implements ClientModInitializer {
     private static void start(double pitch, double yaw) {
         LocalPlayer p = Minecraft.getInstance().player;
         if (p == null) return;
+
+        long now = System.nanoTime();
+        if (hasAccepted && now - lastAcceptedNanos < COOLDOWN_NANOS) return;   // noch gesperrt
+        lastAcceptedNanos = now;
+        hasAccepted = true;
 
         double targetPitch = Mth.clamp(pitch + offset(), -90.0, 90.0);
         double targetYaw = yaw + offset();
