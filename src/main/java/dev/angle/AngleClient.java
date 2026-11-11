@@ -15,8 +15,8 @@ import java.util.Random;
 public class AngleClient implements ClientModInitializer {
 
     // ---- Einstellungen ----
-    private static final double MIN_OFFSET_DEG = 1.0;   // min. Abweichung von Pitch/Yaw
-    private static final double MAX_OFFSET_DEG = 2.0;   // max. Abweichung von Pitch/Yaw (wenige Grad)
+    private static final double MIN_OFFSET_DEG = 0.7;   // min. Abweichung von Pitch/Yaw
+    private static final double MAX_OFFSET_DEG = 1.5;   // max. Abweichung von Pitch/Yaw (wenige Grad)
     private static final double TREMOR_DEG = 0.02;     // minimales Handzittern
 
     // Aus deiner Aufnahme abgeleitetes Bewegungsmodell (Median ueber ~80 Drehungen >= 40 Grad):
@@ -103,7 +103,7 @@ public class AngleClient implements ClientModInitializer {
     }
 
     private static double offset() {
-        // immer ein paar Grad daneben: Betrag 1.0 bis 2.0, Vorzeichen zufaellig
+        // immer ein paar Grad daneben: Betrag 0.7 bis 1.5, Vorzeichen zufaellig
         double mag = MIN_OFFSET_DEG + RNG.nextDouble() * (MAX_OFFSET_DEG - MIN_OFFSET_DEG);
         return RNG.nextBoolean() ? mag : -mag;
     }
