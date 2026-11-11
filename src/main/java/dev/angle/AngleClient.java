@@ -189,13 +189,18 @@ public class AngleClient implements ClientModInitializer {
         if (p == null) { active = false; settling = false; return; }
 
         // Hat der Spieler die Maus bewegt? Dann sofort aufhoeren und seine Kamera nicht ueberschreiben.
-        double devPitch = p.getXRot() - lastSetPitch;
-        double devYaw = Mth.wrapDegrees(p.getYRot() - lastSetYaw);
-        inputAccum += Math.hypot(devPitch, devYaw);
-        if (inputAccum > INPUT_CANCEL_DEG) {
-            active = false;
-            settling = false;
-            return;
+        // In den ersten 0.3 s nach dem Start zaehlt Maus-Input nicht (die Bewegung laeuft ungestoert weiter).
+        if (System.nanoTime() - lastAcceptedNanos < COOLDOWN_NANOS) {
+            inputAccum = 0;
+        } else {
+            double devPitch = p.getXRot() - lastSetPitch;
+            double devYaw = Mth.wrapDegrees(p.getYRot() - lastSetYaw);
+            inputAccum += Math.hypot(devPitch, devYaw);
+            if (inputAccum > INPUT_CANCEL_DEG) {
+                active = false;
+                settling = false;
+                return;
+            }
         }
 
         if (settling) {
