@@ -1,6 +1,7 @@
 package dev.angle;
 
 import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
@@ -49,7 +50,8 @@ public class AngleClient implements ClientModInitializer {
     private static final double BLOCK_SPREAD = 0.22;   // Streuung relativ zur Boxgroesse
     private static final double EDGE_MARGIN = 0.15;    // Mindestabstand zum Rand relativ zur Boxgroesse
     private static final double BLOCK_REACH = 4.5;     // Interaktionsreichweite (Warnung, falls weiter weg)
-    private static boolean blockMode = false;
+    private static boolean blockMode = false;   // Ziel ist ein Block: Hitbox-Pruefung beim Nachdriften
+    private static boolean blockTrack = false;  // keep: Ziel laufend nachfuehren / once: Winkel einmalig fest
     private static AABB targetBox;      // Hitbox in Weltkoordinaten
     private static Vec3 targetPoint;    // gewaehlter Zielpunkt in der Hitbox (Weltkoordinaten)
 
@@ -104,22 +106,8 @@ public class AngleClient implements ClientModInitializer {
                         }
                         return 1;
                     })))
-                .then(ClientCommands.literal("block")
-                    .executes(ctx -> lookedCommand(ctx, false))
-                    .then(ClientCommands.literal("lever")
-                        .executes(ctx -> lookedCommand(ctx, true)))
-                    .then(ClientCommands.argument("x", IntegerArgumentType.integer())
-                        .then(ClientCommands.argument("y", IntegerArgumentType.integer())
-                            .then(ClientCommands.argument("z", IntegerArgumentType.integer())
-                                .executes(ctx -> blockCommand(ctx, false))
-                                .then(ClientCommands.literal("lever")
-                                    .executes(ctx -> blockCommand(ctx, true)))))))
-                .then(ClientCommands.literal("lever")
-                    .executes(ctx -> lookedCommand(ctx, true))
-                    .then(ClientCommands.argument("x", IntegerArgumentType.integer())
-                        .then(ClientCommands.argument("y", IntegerArgumentType.integer())
-                            .then(ClientCommands.argument("z", IntegerArgumentType.integer())
-                                .executes(ctx -> blockCommand(ctx, true))))))
+                .then(blockTree("block", false))
+                .then(blockTree("lever", true))
                 .then(ClientCommands.literal("stop").executes(ctx -> {
                     active = false;
                     settling = false;
@@ -163,23 +151,44 @@ public class AngleClient implements ClientModInitializer {
         double targetPitch = Mth.clamp(pitch + offset(), -90.0, 90.0);
         double targetYaw = yaw + offset();
         blockMode = false;
+        blockTrack = false;
         beginMove(p, targetPitch, targetYaw);
     }
 
-    private static int blockCommand(CommandContext<FabricClientCommandSource> ctx, boolean lever) {
+    /**
+     * /angle block|lever [x y z] [keep|once]
+     * keep (Standard): Ziel wird waehrend der Drehung laufend nachgefuehrt (Spieler darf sich bewegen).
+     * once: Blickrichtung wird nur beim Ausfuehren berechnet, auch wenn der Block out of range ist; kein Nachjustieren.
+     */
+    private static LiteralArgumentBuilder<FabricClientCommandSource> blockTree(String name, boolean lever) {
+        LiteralArgumentBuilder<FabricClientCommandSource> root = ClientCommands.literal(name)
+            .executes(ctx -> lookedCommand(ctx, lever, true))
+            .then(ClientCommands.literal("keep").executes(ctx -> lookedCommand(ctx, lever, true)))
+            .then(ClientCommands.literal("once").executes(ctx -> lookedCommand(ctx, lever, false)))
+            .then(ClientCommands.argument("x", IntegerArgumentType.integer())
+                .then(ClientCommands.argument("y", IntegerArgumentType.integer())
+                    .then(ClientCommands.argument("z", IntegerArgumentType.integer())
+                        .executes(ctx -> blockCommand(ctx, lever, true))
+                        .then(ClientCommands.literal("keep").executes(ctx -> blockCommand(ctx, lever, true)))
+                        .then(ClientCommands.literal("once").executes(ctx -> blockCommand(ctx, lever, false))))));
+        if (!lever) root.then(blockTree("lever", true));   // /angle block lever ...
+        return root;
+    }
+
+    private static int blockCommand(CommandContext<FabricClientCommandSource> ctx, boolean lever, boolean keep) {
         int x = IntegerArgumentType.getInteger(ctx, "x");
         int y = IntegerArgumentType.getInteger(ctx, "y");
         int z = IntegerArgumentType.getInteger(ctx, "z");
-        startBlock(x, y, z, lever, m -> ctx.getSource().sendFeedback(Component.literal(m)));
+        startBlock(x, y, z, lever, keep, m -> ctx.getSource().sendFeedback(Component.literal(m)));
         return 1;
     }
 
     /** Nimmt den Block, auf den das Fadenkreuz gerade zeigt. */
-    private static int lookedCommand(CommandContext<FabricClientCommandSource> ctx, boolean lever) {
+    private static int lookedCommand(CommandContext<FabricClientCommandSource> ctx, boolean lever, boolean keep) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.hitResult instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
             BlockPos pos = hit.getBlockPos();
-            startBlock(pos.getX(), pos.getY(), pos.getZ(), lever, m -> ctx.getSource().sendFeedback(Component.literal(m)));
+            startBlock(pos.getX(), pos.getY(), pos.getZ(), lever, keep, m -> ctx.getSource().sendFeedback(Component.literal(m)));
         } else {
             ctx.getSource().sendFeedback(Component.literal("Du schaust gerade keinen Block an."));
         }
@@ -198,7 +207,7 @@ public class AngleClient implements ClientModInitializer {
         return new AABB(x + 5 / 16.0, y + 4 / 16.0, z + 5 / 16.0, x + 11 / 16.0, y + 12 / 16.0, z + 11 / 16.0);
     }
 
-    private static void startBlock(int x, int y, int z, boolean lever, Consumer<String> msg) {
+    private static void startBlock(int x, int y, int z, boolean lever, boolean keep, Consumer<String> msg) {
         Minecraft mc = Minecraft.getInstance();
         LocalPlayer p = mc.player;
         if (p == null || mc.level == null) return;
@@ -207,7 +216,7 @@ public class AngleClient implements ClientModInitializer {
         AABB box = hitboxOf(mc, x, y, z, lever, msg);
         Vec3 point = pickPoint(box);
         Vec3 eye = p.getEyePosition();
-        if (box.distanceToSqr(eye) > BLOCK_REACH * BLOCK_REACH) {
+        if (keep && box.distanceToSqr(eye) > BLOCK_REACH * BLOCK_REACH) {
             msg.accept("Warnung: Ziel ist weiter als " + BLOCK_REACH + " Bloecke entfernt (ausser Reichweite).");
         }
         markAccepted();
@@ -217,6 +226,7 @@ public class AngleClient implements ClientModInitializer {
         double[] a = anglesTo(eye, point);
         beginMove(p, Mth.clamp(a[0], -90.0, 90.0), a[1]);
         blockMode = true;
+        blockTrack = keep;
     }
 
     /** Zufaelliger Punkt in der Box: gaussverteilt um die Mitte, aber nie naeher als EDGE_MARGIN am Rand. */
@@ -339,7 +349,7 @@ public class AngleClient implements ClientModInitializer {
         }
 
         if (settling) {
-            if (blockMode) {
+            if (blockMode && blockTrack) {
                 double[] tg = currentTarget(p);
                 settleBasePitch = tg[0];
                 settleBaseYaw = tg[1];
@@ -357,7 +367,7 @@ public class AngleClient implements ClientModInitializer {
             return;
         }
 
-        if (blockMode) {
+        if (blockMode && blockTrack) {
             // Spieler laeuft evtl. waehrend der Drehung: Ziel (Punkt in der Hitbox) laufend neu berechnen
             double[] tg = currentTarget(p);
             dPitch = tg[0] - startPitch;
