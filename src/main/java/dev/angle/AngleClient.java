@@ -21,6 +21,9 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Random;
 import java.util.function.Consumer;
 
@@ -111,6 +114,7 @@ public class AngleClient implements ClientModInitializer {
                 .then(ClientCommands.literal("stop").executes(ctx -> {
                     active = false;
                     settling = false;
+                    scheduled.clear();
                     return 1;
                 }))
                 .then(ClientCommands.argument("pitch", DoubleArgumentType.doubleArg(-90, 90))
@@ -155,22 +159,63 @@ public class AngleClient implements ClientModInitializer {
         beginMove(p, targetPitch, targetYaw);
     }
 
+    // ---- Verzoegerte Ausfuehrung: /angle block|lever [x y z] keep|once [sekunden] ----
+    private record Scheduled(long dueNanos, Runnable task) {}
+    private static final List<Scheduled> scheduled = new ArrayList<>();
+
+    private static void runScheduled(Minecraft mc) {
+        if (scheduled.isEmpty()) return;
+        if (mc.player == null || mc.level == null) { scheduled.clear(); return; }
+        long now = System.nanoTime();
+        List<Runnable> due = new ArrayList<>();
+        for (Iterator<Scheduled> it = scheduled.iterator(); it.hasNext(); ) {
+            Scheduled sc = it.next();
+            if (sc.dueNanos() <= now) { due.add(sc.task()); it.remove(); }
+        }
+        for (Runnable r : due) r.run();
+    }
+
+    /** Fuehrt task sofort aus (seconds <= 0) oder nach der angegebenen Zeit (Dezimalzahlen erlaubt). */
+    private static void runOrSchedule(double seconds, Consumer<String> msg, Runnable task) {
+        if (seconds <= 0) { task.run(); return; }
+        scheduled.add(new Scheduled(System.nanoTime() + (long) (seconds * 1_000_000_000.0), task));
+        msg.accept("Wird in " + seconds + " s ausgefuehrt.");
+    }
+
+    private static double secondsOf(CommandContext<FabricClientCommandSource> ctx) {
+        try {
+            return DoubleArgumentType.getDouble(ctx, "seconds");
+        } catch (IllegalArgumentException e) {
+            return 0.0;   // keine Zeit angegeben
+        }
+    }
+
+    /** Literal keep/once, direkt ausfuehrbar oder mit optionaler Sekundenzahl dahinter. */
+    private static LiteralArgumentBuilder<FabricClientCommandSource> modeNode(
+            String literal, boolean lever, boolean keep, boolean coords) {
+        return ClientCommands.literal(literal)
+            .executes(ctx -> coords ? blockCommand(ctx, lever, keep) : lookedCommand(ctx, lever, keep))
+            .then(ClientCommands.argument("seconds", DoubleArgumentType.doubleArg(0, 3600))
+                .executes(ctx -> coords ? blockCommand(ctx, lever, keep) : lookedCommand(ctx, lever, keep)));
+    }
+
     /**
-     * /angle block|lever [x y z] [keep|once]
+     * /angle block|lever [x y z] [keep|once] [sekunden]
      * keep (Standard): Ziel wird waehrend der Drehung laufend nachgefuehrt (Spieler darf sich bewegen).
      * once: Blickrichtung wird nur beim Ausfuehren berechnet, auch wenn der Block out of range ist; kein Nachjustieren.
+     * sekunden (optional, auch Dezimalzahlen): so lange warten, bis der Command wirklich ausgefuehrt wird.
      */
     private static LiteralArgumentBuilder<FabricClientCommandSource> blockTree(String name, boolean lever) {
         LiteralArgumentBuilder<FabricClientCommandSource> root = ClientCommands.literal(name)
             .executes(ctx -> lookedCommand(ctx, lever, true))
-            .then(ClientCommands.literal("keep").executes(ctx -> lookedCommand(ctx, lever, true)))
-            .then(ClientCommands.literal("once").executes(ctx -> lookedCommand(ctx, lever, false)))
+            .then(modeNode("keep", lever, true, false))
+            .then(modeNode("once", lever, false, false))
             .then(ClientCommands.argument("x", IntegerArgumentType.integer())
                 .then(ClientCommands.argument("y", IntegerArgumentType.integer())
                     .then(ClientCommands.argument("z", IntegerArgumentType.integer())
                         .executes(ctx -> blockCommand(ctx, lever, true))
-                        .then(ClientCommands.literal("keep").executes(ctx -> blockCommand(ctx, lever, true)))
-                        .then(ClientCommands.literal("once").executes(ctx -> blockCommand(ctx, lever, false))))));
+                        .then(modeNode("keep", lever, true, true))
+                        .then(modeNode("once", lever, false, true)))));
         if (!lever) root.then(blockTree("lever", true));   // /angle block lever ...
         return root;
     }
@@ -179,19 +224,23 @@ public class AngleClient implements ClientModInitializer {
         int x = IntegerArgumentType.getInteger(ctx, "x");
         int y = IntegerArgumentType.getInteger(ctx, "y");
         int z = IntegerArgumentType.getInteger(ctx, "z");
-        startBlock(x, y, z, lever, keep, m -> ctx.getSource().sendFeedback(Component.literal(m)));
+        Consumer<String> msg = m -> ctx.getSource().sendFeedback(Component.literal(m));
+        runOrSchedule(secondsOf(ctx), msg, () -> startBlock(x, y, z, lever, keep, msg));
         return 1;
     }
 
-    /** Nimmt den Block, auf den das Fadenkreuz gerade zeigt. */
+    /** Nimmt den Block, auf den das Fadenkreuz zeigt - bei Verzoegerung erst im Moment der Ausfuehrung. */
     private static int lookedCommand(CommandContext<FabricClientCommandSource> ctx, boolean lever, boolean keep) {
-        Minecraft mc = Minecraft.getInstance();
-        if (mc.hitResult instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
-            BlockPos pos = hit.getBlockPos();
-            startBlock(pos.getX(), pos.getY(), pos.getZ(), lever, keep, m -> ctx.getSource().sendFeedback(Component.literal(m)));
-        } else {
-            ctx.getSource().sendFeedback(Component.literal("Du schaust gerade keinen Block an."));
-        }
+        Consumer<String> msg = m -> ctx.getSource().sendFeedback(Component.literal(m));
+        runOrSchedule(secondsOf(ctx), msg, () -> {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc.hitResult instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
+                BlockPos pos = hit.getBlockPos();
+                startBlock(pos.getX(), pos.getY(), pos.getZ(), lever, keep, msg);
+            } else {
+                msg.accept("Du schaust gerade keinen Block an.");
+            }
+        });
         return 1;
     }
 
@@ -329,6 +378,7 @@ public class AngleClient implements ClientModInitializer {
     }
 
     private static void tick(Minecraft mc) {
+        runScheduled(mc);
         if (!active) return;
         LocalPlayer p = mc.player;
         if (p == null) { active = false; settling = false; return; }
