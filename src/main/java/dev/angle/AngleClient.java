@@ -1,21 +1,32 @@
 package dev.angle;
 
 import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.context.CommandContext;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.util.Mth;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.Random;
+import java.util.function.Consumer;
 
 public class AngleClient implements ClientModInitializer {
 
     // ---- Einstellungen ----
-    private static final double MIN_OFFSET_DEG = 0.2;   // min. Abweichung von Pitch/Yaw
+    private static final double MIN_OFFSET_DEG = 0.1;   // min. Abweichung von Pitch/Yaw
     private static final double MAX_OFFSET_DEG = 0.4;   // max. Abweichung von Pitch/Yaw (wenige Grad)
     private static final double TREMOR_DEG = 0.02;     // minimales Handzittern
 
@@ -31,6 +42,16 @@ public class AngleClient implements ClientModInitializer {
     private static final double CURVE_MEDIAN = 0.023;     // seitliche Ausbuchtung relativ zur Strecke (dein Median)
 
     private static final Random RNG = new Random();
+
+    // ---- Block-/Hebel-Modus ----
+    // Zielpunkt liegt immer INNERHALB der Hitbox: Streuung gaussverteilt um die Mitte, mindestens EDGE_MARGIN
+    // (Anteil der Boxgroesse) Abstand zum Rand. So ist die "Abweichung" immer noch ein Treffer.
+    private static final double BLOCK_SPREAD = 0.22;   // Streuung relativ zur Boxgroesse
+    private static final double EDGE_MARGIN = 0.15;    // Mindestabstand zum Rand relativ zur Boxgroesse
+    private static final double BLOCK_REACH = 4.5;     // Interaktionsreichweite (Warnung, falls weiter weg)
+    private static boolean blockMode = false;
+    private static AABB targetBox;      // Hitbox in Weltkoordinaten
+    private static Vec3 targetPoint;    // gewaehlter Zielpunkt in der Hitbox (Weltkoordinaten)
 
     // Nachlauf: nach dem Ziel noch kurz minimal weiterdriften (unter 1 Sekunde)
     private static final double SETTLE_MIN_MS = 400, SETTLE_MAX_MS = 900;
@@ -83,6 +104,22 @@ public class AngleClient implements ClientModInitializer {
                         }
                         return 1;
                     })))
+                .then(ClientCommands.literal("block")
+                    .executes(ctx -> lookedCommand(ctx, false))
+                    .then(ClientCommands.literal("lever")
+                        .executes(ctx -> lookedCommand(ctx, true)))
+                    .then(ClientCommands.argument("x", IntegerArgumentType.integer())
+                        .then(ClientCommands.argument("y", IntegerArgumentType.integer())
+                            .then(ClientCommands.argument("z", IntegerArgumentType.integer())
+                                .executes(ctx -> blockCommand(ctx, false))
+                                .then(ClientCommands.literal("lever")
+                                    .executes(ctx -> blockCommand(ctx, true)))))))
+                .then(ClientCommands.literal("lever")
+                    .executes(ctx -> lookedCommand(ctx, true))
+                    .then(ClientCommands.argument("x", IntegerArgumentType.integer())
+                        .then(ClientCommands.argument("y", IntegerArgumentType.integer())
+                            .then(ClientCommands.argument("z", IntegerArgumentType.integer())
+                                .executes(ctx -> blockCommand(ctx, true))))))
                 .then(ClientCommands.literal("stop").executes(ctx -> {
                     active = false;
                     settling = false;
@@ -108,18 +145,116 @@ public class AngleClient implements ClientModInitializer {
         return RNG.nextBoolean() ? mag : -mag;
     }
 
+    private static boolean onCooldown() {
+        return hasAccepted && System.nanoTime() - lastAcceptedNanos < COOLDOWN_NANOS;
+    }
+
+    private static void markAccepted() {
+        lastAcceptedNanos = System.nanoTime();
+        hasAccepted = true;
+    }
+
     private static void start(double pitch, double yaw) {
         LocalPlayer p = Minecraft.getInstance().player;
         if (p == null) return;
-
-        long now = System.nanoTime();
-        if (hasAccepted && now - lastAcceptedNanos < COOLDOWN_NANOS) return;   // noch gesperrt
-        lastAcceptedNanos = now;
-        hasAccepted = true;
+        if (onCooldown()) return;   // noch gesperrt
+        markAccepted();
 
         double targetPitch = Mth.clamp(pitch + offset(), -90.0, 90.0);
         double targetYaw = yaw + offset();
+        blockMode = false;
+        beginMove(p, targetPitch, targetYaw);
+    }
 
+    private static int blockCommand(CommandContext<FabricClientCommandSource> ctx, boolean lever) {
+        int x = IntegerArgumentType.getInteger(ctx, "x");
+        int y = IntegerArgumentType.getInteger(ctx, "y");
+        int z = IntegerArgumentType.getInteger(ctx, "z");
+        startBlock(x, y, z, lever, m -> ctx.getSource().sendFeedback(Component.literal(m)));
+        return 1;
+    }
+
+    /** Nimmt den Block, auf den das Fadenkreuz gerade zeigt. */
+    private static int lookedCommand(CommandContext<FabricClientCommandSource> ctx, boolean lever) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.hitResult instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
+            BlockPos pos = hit.getBlockPos();
+            startBlock(pos.getX(), pos.getY(), pos.getZ(), lever, m -> ctx.getSource().sendFeedback(Component.literal(m)));
+        } else {
+            ctx.getSource().sendFeedback(Component.literal("Du schaust gerade keinen Block an."));
+        }
+        return 1;
+    }
+
+    /** Hitbox des Zielblocks in Weltkoordinaten. Hebel: echte Hebel-Form (Boden/Wand/Decke), sonst Standardbox. */
+    private static AABB hitboxOf(Minecraft mc, int x, int y, int z, boolean lever, Consumer<String> msg) {
+        if (!lever) return new AABB(x, y, z, x + 1.0, y + 1.0, z + 1.0);
+        BlockPos pos = new BlockPos(x, y, z);
+        BlockState st = mc.level.getBlockState(pos);
+        if (st.is(Blocks.LEVER)) {
+            return st.getShape(mc.level, pos).bounds().move(x, y, z);
+        }
+        msg.accept("Hinweis: An " + x + " " + y + " " + z + " ist (client-seitig) kein Hebel geladen - nutze eine Standard-Hebelbox in der Blockmitte.");
+        return new AABB(x + 5 / 16.0, y + 4 / 16.0, z + 5 / 16.0, x + 11 / 16.0, y + 12 / 16.0, z + 11 / 16.0);
+    }
+
+    private static void startBlock(int x, int y, int z, boolean lever, Consumer<String> msg) {
+        Minecraft mc = Minecraft.getInstance();
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null) return;
+        if (onCooldown()) return;
+
+        AABB box = hitboxOf(mc, x, y, z, lever, msg);
+        Vec3 point = pickPoint(box);
+        Vec3 eye = p.getEyePosition();
+        if (box.distanceToSqr(eye) > BLOCK_REACH * BLOCK_REACH) {
+            msg.accept("Warnung: Ziel ist weiter als " + BLOCK_REACH + " Bloecke entfernt (ausser Reichweite).");
+        }
+        markAccepted();
+
+        targetBox = box;
+        targetPoint = point;
+        double[] a = anglesTo(eye, point);
+        beginMove(p, Mth.clamp(a[0], -90.0, 90.0), a[1]);
+        blockMode = true;
+    }
+
+    /** Zufaelliger Punkt in der Box: gaussverteilt um die Mitte, aber nie naeher als EDGE_MARGIN am Rand. */
+    private static Vec3 pickPoint(AABB b) {
+        return new Vec3(pick(b.minX, b.maxX), pick(b.minY, b.maxY), pick(b.minZ, b.maxZ));
+    }
+
+    private static double pick(double min, double max) {
+        double size = max - min;
+        double v = (min + max) / 2.0 + RNG.nextGaussian() * size * BLOCK_SPREAD;
+        double m = size * EDGE_MARGIN;
+        return Mth.clamp(v, min + m, max - m);
+    }
+
+    /** {pitch, yaw} in Grad, um vom Auge zum Punkt zu schauen (yaw normalisiert). */
+    private static double[] anglesTo(Vec3 eye, Vec3 t) {
+        double dx = t.x - eye.x, dy = t.y - eye.y, dz = t.z - eye.z;
+        double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+        double pitch = -Math.toDegrees(Math.atan2(dy, Math.hypot(dx, dz)));
+        return new double[] { pitch, yaw };
+    }
+
+    /** Aktuelles Ziel {pitch, yaw}; yaw als Rohwert nahe an der aktuellen Kamera (kein Sprung bei +-180). */
+    private static double[] currentTarget(LocalPlayer p) {
+        double[] a = anglesTo(p.getEyePosition(), targetPoint);
+        double ref = lastSetYaw;
+        return new double[] { Mth.clamp(a[0], -90.0, 90.0), ref + Mth.wrapDegrees(a[1] - ref) };
+    }
+
+    /** Trifft ein Blick mit (pitch, yaw) von eye aus die Hitbox? */
+    private static boolean hits(Vec3 eye, double pitch, double yaw) {
+        if (targetBox.contains(eye)) return true;
+        double pr = Math.toRadians(pitch), yr = Math.toRadians(yaw);
+        Vec3 dir = new Vec3(-Math.sin(yr) * Math.cos(pr), -Math.sin(pr), Math.cos(yr) * Math.cos(pr));
+        return targetBox.clip(eye, eye.add(dir.scale(16.0))).isPresent();
+    }
+
+    private static void beginMove(LocalPlayer p, double targetPitch, double targetYaw) {
         startPitch = p.getXRot();
         startYaw = p.getYRot();
         dPitch = targetPitch - startPitch;
@@ -204,6 +339,11 @@ public class AngleClient implements ClientModInitializer {
         }
 
         if (settling) {
+            if (blockMode) {
+                double[] tg = currentTarget(p);
+                settleBasePitch = tg[0];
+                settleBaseYaw = tg[1];
+            }
             double u = Mth.clamp((System.nanoTime() - settleStartNanos) / 1_000_000.0 / settleMs, 0.0, 1.0);
             double e = minJerk(u);
             double fadeS = 1.0 - u;
@@ -215,6 +355,13 @@ public class AngleClient implements ClientModInitializer {
             lastSetYaw = p.getYRot();
             if (u >= 1.0) { active = false; settling = false; }
             return;
+        }
+
+        if (blockMode) {
+            // Spieler laeuft evtl. waehrend der Drehung: Ziel (Punkt in der Hitbox) laufend neu berechnen
+            double[] tg = currentTarget(p);
+            dPitch = tg[0] - startPitch;
+            dYaw = tg[1] - startYaw;
         }
 
         double elapsedMs = (System.nanoTime() - startNanos) / 1_000_000.0;
@@ -238,17 +385,26 @@ public class AngleClient implements ClientModInitializer {
         lastSetPitch = p.getXRot();
         lastSetYaw = p.getYRot();
 
-        if (t >= 1.0) beginSettle();
+        if (t >= 1.0) beginSettle(p);
     }
 
     /** Kurzes, minimales Weiterdriften in grob gleicher Richtung, dann Stillstand. */
-    private static void beginSettle() {
+    private static void beginSettle(LocalPlayer p) {
         settleBasePitch = startPitch + dPitch;
         settleBaseYaw = startYaw + dYaw;
-        double heading = RNG.nextDouble() * 2 * Math.PI;   // in deiner Aufnahme keine Vorzugsrichtung
-        double mag = SETTLE_MIN_DEG + RNG.nextDouble() * (SETTLE_MAX_DEG - SETTLE_MIN_DEG);
-        settleDYaw = Math.cos(heading) * mag;
-        settleDPitch = Math.sin(heading) * mag;
+        settleDYaw = 0;
+        settleDPitch = 0;
+        for (int i = 0; i < 12; i++) {
+            double heading = RNG.nextDouble() * 2 * Math.PI;   // in deiner Aufnahme keine Vorzugsrichtung
+            double mag = SETTLE_MIN_DEG + RNG.nextDouble() * (SETTLE_MAX_DEG - SETTLE_MIN_DEG);
+            double dy = Math.cos(heading) * mag, dp = Math.sin(heading) * mag;
+            // Block-Modus: der Endpunkt des Driftens muss noch in der Hitbox liegen, sonst neu wuerfeln
+            if (!blockMode || hits(p.getEyePosition(), settleBasePitch + dp, settleBaseYaw + dy)) {
+                settleDYaw = dy;
+                settleDPitch = dp;
+                break;
+            }
+        }
         settleMs = SETTLE_MIN_MS + RNG.nextDouble() * (SETTLE_MAX_MS - SETTLE_MIN_MS);
         settleStartNanos = System.nanoTime();
         settling = true;

@@ -3,7 +3,7 @@
   "id": "angle",
   "version": "${version}",
   "name": "Angle",
-  "description": "Client-Command /angle <pitch> <yaw>: dreht die Kamera menschlich zum Zielwinkel.",
+  "description": "Client-Command /angle <pitch> <yaw> und /angle block|lever <x> <y> <z>: dreht die Kamera menschlich zum Zielwinkel bzw. in die Hitbox eines Blocks/Hebels.",
   "environment": "client",
   "entrypoints": { "client": [ "dev.angle.AngleClient" ] },
   "depends": {
